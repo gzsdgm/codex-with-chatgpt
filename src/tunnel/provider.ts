@@ -9,6 +9,11 @@ export interface TunnelStatus {
   url: string | null;
   provider: string;
   detail?: string;
+  /**
+   * Non-sensitive authentication mode of a named tunnel
+   * (`token-file` | `token-env` | `local-config`). Never the credential itself.
+   */
+  authMode?: string;
 }
 
 export interface TunnelDoctorReport {

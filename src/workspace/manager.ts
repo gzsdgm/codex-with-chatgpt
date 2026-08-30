@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import readline from "node:readline";
 import { IgnoreRules } from "./ignore.js";
 import { readJsonIfExists } from "../config/paths.js";
+import type { ProjectTunnelConfig } from "../tunnel/config.js";
 
 export type WorkspaceErrorCode =
   | "INVALID_PATH"
@@ -58,6 +59,8 @@ export interface ListDirectoryResult {
 export interface ProjectConfig {
   name?: string;
   maxIterations?: number;
+  /** Optional tunnel overrides; environment variables still win. */
+  tunnel?: ProjectTunnelConfig;
 }
 
 const DEFAULT_MAX_LINES = 400;

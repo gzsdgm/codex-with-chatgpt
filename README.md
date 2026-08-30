@@ -151,6 +151,158 @@ The only step that may need you: logging into ChatGPT (and nothing else).
   git diff and test records through MCP — it never trusts "all tests passed"
   claims blindly.
 
+## Tunnels: Quick vs Named
+
+Two Cloudflare tunnel modes are supported. **Quick Tunnel is the default and is
+unchanged for existing installations.**
+
+| | Quick Tunnel (default) | Named Tunnel |
+| --- | --- | --- |
+| Setup | none | Cloudflare account + domain + tunnel credentials/token |
+| Public URL | `https://<random>.trycloudflare.com` — changes on every start | `https://<your-hostname>` — fixed |
+| ChatGPT Connector | Server URL must be updated whenever the URL changes | configure once, never touch again |
+| Best for | first try, throwaway sessions | long-lived connectors |
+
+### Named Tunnel configuration
+
+Resolution order: environment variables → the optional `tunnel` block of the
+workspace's `.c2c.json` → defaults.
+
+| Variable | Meaning |
+| --- | --- |
+| `C2C_TUNNEL_MODE` | `quick` (default) or `named` |
+| `C2C_TUNNEL_TOKEN_FILE` | path to a file holding the token — MODE A, **recommended** |
+| `C2C_TUNNEL_TOKEN` | inline Cloudflare tunnel token — MODE A, transient/compat |
+| `C2C_TUNNEL_HOSTNAME` | fixed hostname, e.g. `c2c.example.com` (both modes) |
+| `C2C_TUNNEL_NAME` | tunnel name — MODE B, locally-managed |
+| `C2C_TUNNEL_CONFIG` | path to a cloudflared `config.yml` (MODE B only) |
+| `C2C_TUNNEL_FALLBACK_QUICK` | `1` to allow falling back to a Quick Tunnel (default: **no fallback**) |
+| `C2C_CLOUDFLARED_PROTOCOL` | `auto` (default), `quic` or `http2` |
+| `C2C_TUNNEL_TOKEN_IN_ARGV` | legacy: pass the token as `--token` instead of via env (default: off) |
+
+Two named-tunnel flavours are supported. Pick one — do not mix them.
+
+**MODE A · remotely-managed (token)** — no `config.yml` on this machine:
+
+```bash
+export C2C_TUNNEL_MODE=named
+export C2C_TUNNEL_HOSTNAME=c2c.example.com
+
+# Recommended: store the token in a file, once. The token never touches the
+# shell history, the registry or the process command line.
+node <checkout>/dist/cli/index.js tunnel-token import   # paste the token, press Enter
+setx C2C_TUNNEL_TOKEN_FILE "%C2C_STATE_DIR%\secrets\cloudflare-tunnel.token"
+
+# Transient / compatibility alternative (do NOT put this in a persistent
+# Windows user variable for a long-lived tunnel):
+#   export C2C_TUNNEL_TOKEN=<your tunnel token>
+
+c2c restart -w <workspace> --tunnel
+```
+
+In the Cloudflare dashboard, configure the tunnel's **Published application**:
+
+```
+c2c.example.com  ->  http://127.0.0.1:48765
+```
+
+**MODE B · locally-managed (name + config.yml)**:
+
+```bash
+export C2C_TUNNEL_MODE=named
+export C2C_TUNNEL_NAME=my-tunnel
+export C2C_TUNNEL_CONFIG=C:\Users\<you>\.cloudflared\config.yml
+export C2C_TUNNEL_HOSTNAME=c2c.example.com
+c2c restart -w <workspace> --tunnel
+```
+
+`config.yml` carries the routing:
+
+```yaml
+tunnel: my-tunnel
+credentials-file: C:\Users\<you>\.cloudflared\<tunnel-id>.json
+ingress:
+  - hostname: c2c.example.com
+    service: http://127.0.0.1:48765
+  - service: http_status:404
+```
+
+The bridge reads the mode at startup, so restart it after changing any
+`C2C_TUNNEL_*` variable.
+
+**Which token input should I use?**
+
+| | `C2C_TUNNEL_TOKEN_FILE` | `C2C_TUNNEL_TOKEN` |
+| --- | --- | --- |
+| Use for | Windows logon autostart, long-lived fixed tunnels | transient sessions, compatibility |
+| Stored in | a file inside `C2C_STATE_DIR` | an environment variable |
+| Survives reboot | yes (file on disk) | only if persisted in the registry — avoid for real tokens |
+| Token in shell history / argv | never | never in argv, but `setx` writes it to `HKCU\Environment` |
+
+**How the token is passed to cloudflared.** Only the *path* is handed over,
+through the child process environment variable `TUNNEL_TOKEN_FILE`
+(official cloudflared option). c2c never reads the file's contents, so the token
+exists only inside cloudflared's own process. With `C2C_TUNNEL_TOKEN`, c2c maps
+it to cloudflared's `TUNNEL_TOKEN` instead. Never set both — cloudflared lets
+`--token` override `--token-file`, so c2c passes exactly one of them.
+
+Neither value may live in `.c2c.json` (that file is inside the workspace and is
+routinely shown to ChatGPT). `process.env` is never modified — only the spawned
+cloudflared receives the variable. For old cloudflared builds that ignore the
+environment variables, `C2C_TUNNEL_TOKEN_IN_ARGV=1` falls back to
+`--token <value>`; it is off by default and only affects `C2C_TUNNEL_TOKEN`,
+never the token file.
+
+**Token file safety.** `c2c tunnel-token import` reads the token from stdin
+(so it never enters argv or shell history), writes it atomically, and restricts
+the file to the owning user, SYSTEM and Administrators. If hardening fails the
+file is kept, never deleted. `c2c doctor` reports
+`TOKEN_FILE_EXISTS` / `TOKEN_FILE_ACL_SECURE` and prints nothing but the status.
+`c2c status` reports the non-sensitive auth mode:
+`token-file` / `token-env` / `local-config`.
+
+Named mode **never** falls back to a random URL: if the tunnel cannot start,
+`c2c doctor` reports the exact reason and the Connector URL stays untouched.
+Set `C2C_TUNNEL_FALLBACK_QUICK=1` only if you accept a changing URL.
+
+Secrets: the tunnel token is read from the environment only — never from
+`.c2c.json`, which lives in the workspace and is routinely shown to ChatGPT —
+and it is redacted from every log line.
+
+### Windows notes
+
+- **State directory.** OAuth tokens, sessions and logs live in
+  `%LOCALAPPDATA%\codex-with-chatgpt`. Codex runs as an MSIX package, so the
+  same directory is physically stored under
+  `%LOCALAPPDATA%\Packages\OpenAI.Codex_<id>\LocalCache\Local\codex-with-chatgpt`.
+  Pin it once so Codex, your terminal and the logon script all agree:
+
+  ```bat
+  setx C2C_STATE_DIR "C:\Users\<you>\AppData\Local\Packages\OpenAI.Codex_<id>\LocalCache\Local\codex-with-chatgpt"
+  ```
+
+- **Auto-start after logon.** `scripts/c2c-autostart.vbs` restores the bridge
+  and tunnel in the background (hidden, no console window, idempotent: a
+  healthy instance is never started twice). Put it — or a shortcut to it — in
+  `shell:startup` and list the workspaces in `scripts/c2c-autostart.json`.
+
+- **Proxies that break QUIC** (e.g. Clash fake-IP ranges, `198.18.x.x`):
+  set `C2C_CLOUDFLARED_PROTOCOL=http2`.
+
+`--protocol` is a hidden `cloudflared tunnel` option: it does not appear in
+`cloudflared tunnel --help`. c2c therefore probes the real syntax
+(`cloudflared tunnel --protocol <value> run __c2c_capability_probe__`, a tunnel
+name that cannot exist, so no connection is opened) and only adds the flag when
+cloudflared accepts it. The flag is placed right after `tunnel`, which is the
+official syntax:
+
+```
+cloudflared tunnel --protocol http2 --no-autoupdate run          # MODE A (token via env)
+cloudflared tunnel --protocol http2 --url http://127.0.0.1:48765 --no-autoupdate   # Quick
+```
+
+If your build rejects the flag, c2c silently keeps the default transport.
+
 ## Security model (short version)
 
 - **Read-only by construction**: write/delete/shell/commit tools simply do not

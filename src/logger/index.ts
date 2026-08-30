@@ -13,6 +13,7 @@ const REDACT_PATTERNS: RegExp[] = [
   /(authorization"?\s*[:=]\s*"?bearer\s+)[^\s"']+/gi,
   /((?:access_token|refresh_token|client_secret|code_verifier|code|token)"?\s*[:=]\s*"?)[A-Za-z0-9._~+/-]{16,}/gi,
   /\b[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}\b/g, // pairing-code shaped strings
+  /(--token["'\s]+)[^\s"']+/gi, // cloudflared tunnel token passed as an argument
 ];
 
 export function redact(input: string): string {

@@ -8,7 +8,7 @@ import { bearerAuth } from "../auth/middleware.js";
 import { PairingManager } from "../pairing/manager.js";
 import { createMcpServer } from "../mcp/server.js";
 import { createMcpHttpHandler } from "../mcp/http.js";
-import { CloudflaredQuickTunnel } from "../tunnel/cloudflared.js";
+import { createTunnelProvider } from "../tunnel/index.js";
 import type { TunnelProvider } from "../tunnel/provider.js";
 import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
@@ -75,7 +75,9 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
 
   const authStore = new AuthStore(workspace.id, { file: opts.authStoreFile });
   const pairing = new PairingManager(workspace.id, { ttlMs: opts.pairingTtlMs });
-  const tunnel = opts.tunnelProvider ?? new CloudflaredQuickTunnel(logger);
+  // Mode (quick | named) is resolved from C2C_TUNNEL_* env vars and the
+  // workspace's .c2c.json `tunnel` block. Default: Quick Tunnel, unchanged.
+  const tunnel = opts.tunnelProvider ?? createTunnelProvider(logger, { project: workspace.projectConfig.tunnel });
   const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
 
   let publicBaseUrl: string | null = null;

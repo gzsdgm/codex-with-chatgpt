@@ -10,6 +10,12 @@ import { Workspace } from "../workspace/manager.js";
 import { AuthStore } from "../auth/store.js";
 import { appendExecutionRecord } from "../execution/records.js";
 import { detectTunnelBinaries } from "../tunnel/detect.js";
+import {
+  defaultTokenFilePath,
+  inspectTokenFile,
+  resolveTunnelConfig,
+  secureTokenFile,
+} from "../tunnel/config.js";
 import { Logger } from "../logger/index.js";
 import { getStateDir } from "../config/paths.js";
 import { PRODUCT_NAME, VERSION } from "../version.js";
@@ -43,7 +49,7 @@ interface AdminInfo {
   workspaceRoot: string;
   port: number;
   publicUrl: string | null;
-  tunnel: { running: boolean; url: string | null; provider: string };
+  tunnel: { running: boolean; url: string | null; provider: string; authMode?: string };
   tokenCount: number;
   pairingActive: boolean;
   pid: number;
@@ -228,6 +234,7 @@ program
     check(`Bridge：运行中（端口 ${info.port}）`);
     if (info.tunnel.running && info.tunnel.url) check(`安全连接：${info.tunnel.url}/mcp`);
     else say("· 安全连接：未启用（本地模式）");
+    if (info.tunnel.authMode) say(`· 认证模式：${info.tunnel.authMode}`);
     say(`· 已授权连接：${info.tokenCount > 0 ? "是" : "否"}`);
   });
 
@@ -255,6 +262,19 @@ program
       report.workspace = { ok: true, detail: workspace.name };
     } catch (error) {
       report.workspace = { ok: false, detail: (error as Error).message };
+    }
+
+    // Token file (named tunnels): existence + ACL only. The contents are never
+    // read, printed or logged.
+    const tunnelSettings = resolveTunnelConfig();
+    if (tunnelSettings.mode === "named" && tunnelSettings.named.tokenFile) {
+      const acl = inspectTokenFile(tunnelSettings.named.tokenFile);
+      if (acl) {
+        report.tokenFile = {
+          ok: acl.exists && acl.isFile && acl.secure,
+          detail: `TOKEN_FILE_EXISTS=${acl.exists} TOKEN_FILE_ACL_SECURE=${acl.secure}（${acl.detail}）`,
+        };
+      }
     }
 
     // Bridge
@@ -322,6 +342,7 @@ program
     say("");
     const labels: Record<string, string> = {
       node: "Node.js",
+      tokenFile: "Token 文件",
       workspace: "Workspace",
       bridge: "Bridge",
       mcp: "MCP",
@@ -420,6 +441,59 @@ program
       say(`Workspace：${data.name}（${data.workspaceId}）`);
       say(`类型：${data.projectType}  语言：${data.languages.join(", ") || "-"}`);
       say(`路径：${data.root}`);
+    }
+  });
+
+// ---------------------------------------------------------------- tunnel-token
+
+const tunnelToken = program
+  .command("tunnel-token")
+  .description("Manage the Cloudflare tunnel token file (never passed through argv)");
+
+tunnelToken
+  .command("path", { isDefault: true })
+  .description("Show the default token file path")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { json: boolean }) => {
+    const file = defaultTokenFilePath(getStateDir());
+    if (opts.json) {
+      say(JSON.stringify({ ok: true, path: file }));
+      return;
+    }
+    say(file);
+  });
+
+tunnelToken
+  .command("import")
+  .description("Read a Cloudflare tunnel token from stdin and store it outside the shell history")
+  .option("--file <path>", "destination (defaults to <state dir>/secrets/cloudflare-tunnel.token)")
+  .action(async (opts: { file?: string }) => {
+    const dest = path.resolve(opts.file ?? defaultTokenFilePath(getStateDir()));
+    process.stderr.write("请粘贴 Cloudflare tunnel token，然后回车（输入不会被记录到日志或历史）：\n");
+    const chunks: Buffer[] = [];
+    for await (const chunk of process.stdin) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const token = Buffer.concat(chunks).toString("utf8").trim();
+    if (token === "") {
+      cross("未读取到 token，已取消（未写入任何文件）。");
+      process.exitCode = 1;
+      return;
+    }
+    try {
+      fs.mkdirSync(path.dirname(dest), { recursive: true, mode: 0o700 });
+      const tmp = `${dest}.tmp-${process.pid}`;
+      fs.writeFileSync(tmp, `${token}\n`, { mode: 0o600 });
+      fs.renameSync(tmp, dest); // atomic replace
+    } catch (error) {
+      // Never echo the token back, even on failure.
+      cross(`写入 token 文件失败：${(error as Error).message}`);
+      process.exitCode = 1;
+      return;
+    }
+    const acl = secureTokenFile(dest);
+    check(`已保存：${dest}`);
+    say(`· 权限：${acl.detail}`);
+    if (!acl.ok) {
+      cross("权限加固未完全成功，请手动检查该文件 ACL（文件已保留，不会被删除）。");
     }
   });
 
