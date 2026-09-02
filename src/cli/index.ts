@@ -7,8 +7,9 @@ import { startBridge } from "../bridge/server.js";
 import { findLiveBridge, probeBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
 import { adminFetch, ensureBridge, stopBridge } from "../process/daemon.js";
 import { Workspace } from "../workspace/manager.js";
+import { gitInfo } from "../workspace/git.js";
 import { AuthStore } from "../auth/store.js";
-import { appendExecutionRecord } from "../execution/records.js";
+import { appendExecutionRecord, beginTask, taskRegistryPath } from "../execution/records.js";
 import { detectTunnelBinaries } from "../tunnel/detect.js";
 import {
   defaultTokenFilePath,
@@ -19,6 +20,18 @@ import {
 import { Logger } from "../logger/index.js";
 import { getStateDir } from "../config/paths.js";
 import { PRODUCT_NAME, VERSION } from "../version.js";
+import {
+  assertMainWorktreeReadOnly,
+  assertTaskRegistrationReady,
+  createTaskWorktree,
+  findTaskRegistryByWorktree,
+  inspectTaskScope,
+  registerTask,
+  markTaskBlocked,
+  withAuthorizedTaskExecution,
+  writeExecutionSummary,
+  type TaskRegistrationInput,
+} from "../task/isolation.js";
 
 const program = new Command();
 
@@ -632,6 +645,209 @@ session
     check("已清除会话记录，下次任务将新建 ChatGPT 会话");
   });
 
+function parseTaskList(value: string, optionName: string): string[] {
+  const trimmed = value.trim();
+  if (trimmed === "") throw new Error(`INVALID_${optionName.toUpperCase().replaceAll("-", "_")}`);
+  if (trimmed.startsWith("[")) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      throw new Error(`INVALID_${optionName.toUpperCase().replaceAll("-", "_")}`);
+    }
+    if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string" || item.trim() === "")) {
+      throw new Error(`INVALID_${optionName.toUpperCase().replaceAll("-", "_")}`);
+    }
+    return parsed.map((item) => item.trim());
+  }
+  const values = trimmed.split(",").map((item) => item.trim()).filter(Boolean);
+  if (values.length === 0) throw new Error(`INVALID_${optionName.toUpperCase().replaceAll("-", "_")}`);
+  return values;
+}
+
+// ---------------------------------------------------------------- task identity
+
+const task = program.command("task").description("Persist and verify C2C task identity");
+
+task
+  .command("begin")
+  .description("Persist task identity before any code changes")
+  .requiredOption("-w, --workspace <path>", "workspace root")
+  .requiredOption("--task <id>", "task id")
+  .requiredOption("--iteration <n>", "starting iteration")
+  .requiredOption("--baseline <head>", "baseline HEAD")
+  .requiredOption("--allowed-files <files>", "comma-separated allowed files")
+  .requiredOption("--acceptance <commands>", "comma-separated acceptance commands")
+  .requiredOption("--stop-conditions <conditions>", "comma-separated stop conditions")
+  .option("--json", "machine-readable output", false)
+  .action(
+    (opts: {
+      workspace: string;
+      task: string;
+      iteration: string;
+      baseline: string;
+      allowedFiles: string;
+      acceptance: string;
+      stopConditions: string;
+      json: boolean;
+    }) => {
+      try {
+        const workspace = new Workspace(resolveWorkspace(opts.workspace));
+        assertMainWorktreeReadOnly(workspace.root, "write");
+        if (gitInfo(workspace.root).isRepo) throw new Error("TASK_WORKTREE_REQUIRED: use c2c task create or register");
+        const registry = beginTask({
+          taskId: opts.task,
+          workspaceId: workspace.id,
+          workspaceRoot: workspace.root,
+          iteration: parseInt(opts.iteration, 10),
+          baselineHead: opts.baseline,
+          allowedFiles: parseTaskList(opts.allowedFiles, "allowed-files"),
+          acceptanceCommands: parseTaskList(opts.acceptance, "acceptance"),
+          stopConditions: parseTaskList(opts.stopConditions, "stop-conditions"),
+        });
+        if (opts.json) say(JSON.stringify({ ok: true, registry }));
+        else {
+          check(`已持久化任务身份：${registry.taskId}`);
+          say(`· Registry：${taskRegistryPath(registry.workspaceId, registry.taskId)}`);
+          say("· TASK_BEGIN_PERSISTENCE=PASS");
+          say("· TASK_BEGIN_REREAD_VERIFY=PASS");
+        }
+      } catch (error) {
+        handleCliError(error, opts.json);
+      }
+    }
+  );
+
+task
+  .command("create")
+  .description("Create and register a dedicated task worktree")
+  .requiredOption("-w, --workspace <path>", "source workspace root")
+  .requiredOption("--task <id>", "task id")
+  .requiredOption("--baseline <head>", "pinned baseline HEAD")
+  .requiredOption("--allowed-files <files>", "comma-separated allowed files")
+  .requiredOption("--acceptance <commands>", "comma-separated acceptance commands")
+  .option("--worktree <path>", "dedicated worktree root")
+  .option("--branch <name>", "task branch (defaults to task/<id>)")
+  .option("--json", "machine-readable output", false)
+  .action((opts: {
+    workspace: string;
+    task: string;
+    baseline: string;
+    allowedFiles: string;
+    acceptance: string;
+    worktree?: string;
+    branch?: string;
+    json: boolean;
+  }) => {
+    try {
+      const registry = createTaskWorktree({
+        taskId: opts.task,
+        workspaceRoot: resolveWorkspace(opts.workspace),
+        baselineHead: opts.baseline,
+        worktreeRoot: opts.worktree,
+        branch: opts.branch,
+        allowedFiles: parseTaskList(opts.allowedFiles, "allowed-files"),
+        acceptanceCommands: parseTaskList(opts.acceptance, "acceptance"),
+      });
+      if (opts.json) say(JSON.stringify({ ok: true, registry }));
+      else {
+        check(`已创建隔离任务工作树：${registry.taskId}`);
+        say(`· Worktree：${registry.worktreeRoot}`);
+        say(`· Branch：${registry.branch}`);
+        say(`· Baseline：${registry.baselineHead}`);
+        say("· TASK_REGISTERED=YES");
+      }
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+task
+  .command("register")
+  .description("Register an existing dedicated task worktree")
+  .requiredOption("-w, --workspace <path>", "source workspace root")
+  .requiredOption("--task <id>", "task id")
+  .requiredOption("--worktree <path>", "dedicated worktree root")
+  .requiredOption("--branch <name>", "task branch")
+  .requiredOption("--baseline <head>", "pinned baseline HEAD")
+  .requiredOption("--allowed-files <files>", "comma-separated allowed files")
+  .requiredOption("--acceptance <commands>", "comma-separated acceptance commands")
+  .option("--json", "machine-readable output", false)
+  .action((opts: {
+    workspace: string;
+    task: string;
+    worktree: string;
+    branch: string;
+    baseline: string;
+    allowedFiles: string;
+    acceptance: string;
+    json: boolean;
+  }) => {
+    try {
+      const input: TaskRegistrationInput = {
+        taskId: opts.task,
+        workspaceRoot: resolveWorkspace(opts.workspace),
+        worktreeRoot: resolveWorkspace(opts.worktree),
+        branch: opts.branch,
+        baselineHead: opts.baseline,
+        allowedFiles: parseTaskList(opts.allowedFiles, "allowed-files"),
+        acceptanceCommands: parseTaskList(opts.acceptance, "acceptance"),
+      };
+      const registry = registerTask(input);
+      if (opts.json) say(JSON.stringify({ ok: true, registry }));
+      else check(`已登记隔离任务：${registry.taskId}`);
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+task
+  .command("verify")
+  .description("Verify task registry, workspace identity, worktree, branch and baseline")
+  .requiredOption("-w, --workspace <path>", "source workspace root")
+  .requiredOption("--worktree <path>", "actual task worktree root")
+  .requiredOption("--task <id>", "task id")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace: string; worktree: string; task: string; json: boolean }) => {
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const registry = assertTaskRegistrationReady({
+        taskId: opts.task,
+        workspaceName: workspace.name,
+        workspaceRoot: workspace.root,
+        worktreeRoot: resolveWorkspace(opts.worktree),
+      });
+      const result = { ok: true, taskId: registry.taskId, TASK_REGISTERED: "YES", WORKTREE_MATCH: "YES", BRANCH_MATCH: "YES", BASELINE_MATCH: "YES" };
+      if (opts.json) say(JSON.stringify(result));
+      else say(JSON.stringify(result, null, 2));
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+task
+  .command("scope")
+  .description("Compare task diff and status against the persisted allowed files")
+  .requiredOption("--task <id>", "task id")
+  .requiredOption("--worktree <path>", "actual task worktree root")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { task: string; worktree: string; json: boolean }) => {
+    try {
+      const report = inspectTaskScope(opts.task, resolveWorkspace(opts.worktree));
+      if (opts.json) say(JSON.stringify(report));
+      else {
+        say(`STATUS=${report.status}`);
+        say(`TRACKED_MODIFIED=${report.trackedModified.join(",") || "NONE"}`);
+        say(`OUTSIDE_TRACKED=${report.outsideTracked.join(",") || "NONE"}`);
+        say(`UNTRACKED=${report.untracked.join(",") || "NONE"}`);
+        say(`IGNORED=${report.ignoredFiles.join(",") || "NONE"}`);
+      }
+      if (report.status !== "PASS") process.exitCode = 1;
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
 program
   .command("record", { hidden: true })
   .description("Record a Codex execution summary (used by the Skill)")
@@ -656,6 +872,41 @@ program
       const changed = /^\d+$/.test(opts.changedFiles)
         ? parseInt(opts.changedFiles, 10)
         : opts.changedFiles.split(",").map((file) => file.trim()).filter(Boolean);
+      const isolated = findTaskRegistryByWorktree(workspace.root);
+      if (isolated) {
+        if (isolated.taskId !== opts.task) throw new Error(`TASK_WORKTREE_MISMATCH: expected ${isolated.taskId}, got ${opts.task}`);
+        if (!isolated.worktreeRoot || !isolated.branch) throw new Error(`TASK_WORKTREE_REQUIRED: ${opts.task}`);
+        const source = new Workspace(isolated.workspaceRoot);
+        withAuthorizedTaskExecution({
+          taskId: opts.task,
+          workspaceName: source.name,
+          workspaceRoot: source.root,
+          worktreeRoot: workspace.root,
+        }, (authorized) => {
+          if (!authorized.worktreeRoot || !authorized.branch) throw new Error(`TASK_WORKTREE_REQUIRED: ${opts.task}`);
+          const scope = inspectTaskScope(opts.task, workspace.root);
+          if (scope.status !== "PASS") {
+            markTaskBlocked(opts.task, `${scope.status}: ${scope.outsideTracked.concat(scope.untracked).join(", ") || scope.finalStatus}`);
+            throw new Error(`${scope.status}: ${scope.outsideTracked.concat(scope.untracked).join(", ") || scope.finalStatus}`);
+          }
+          writeExecutionSummary({
+            taskId: opts.task,
+            iteration: parseInt(opts.iteration, 10),
+            worktreeRoot: authorized.worktreeRoot,
+            branch: authorized.branch,
+            baselineHead: authorized.baselineHead,
+            allowedFiles: isolated.allowedFiles,
+            testsActuallyRun: opts.tests ?? null,
+            finalDiff: scope.finalDiff,
+            finalStatus: scope.finalStatus,
+            status: opts.exitStatus,
+            recordedAt: new Date().toISOString(),
+          });
+          check("已记录隔离任务执行摘要");
+        });
+        return;
+      }
+      if (gitInfo(workspace.root).isRepo) throw new Error("TASK_CONTEXT_REQUIRED: a registered task worktree is required");
       appendExecutionRecord(workspace.id, {
         taskId: opts.task,
         iteration: parseInt(opts.iteration, 10),
@@ -664,7 +915,7 @@ program
         exitStatus: opts.exitStatus,
         timestamp: new Date().toISOString(),
         notes: opts.notes,
-      });
+      }, workspace.root);
       check("已记录执行摘要");
     }
   );

@@ -148,7 +148,13 @@ All control messages start with `[C2C]`. Keep Codex→ChatGPT messages under 1 K
 ChatGPT's replies are expected to be substantive (see step 3). Docs: `docs/protocol.md`.
 
 0. Ensure the bridge is healthy: `c2c doctor -w <workspace> --json` (auto-repairs).
-   Generate task id: `c2c_` + 4 random hex chars.
+   Generate the task id, then persist it before any code modification:
+   `c2c task create -w <workspace> --task <id> --baseline <HEAD> --allowed-files "..." --acceptance "..."`.
+   Then run `c2c task verify -w <workspace> --worktree <task-worktree> --task <id>`.
+   Continue only after both commands return exit 0 and report a registered task
+   with matching worktree, branch and baseline.
+   A failed task registration is fail-closed: do not modify files, run
+   implementation steps, or send EXECUTED.
 1. Open the saved C2C conversation (`c2c session --json`); only create a new chat
    if none is saved. On a NEW conversation first send the boot prompt from
    `docs/protocol.md` §Boot Prompt, then save the session URL.
@@ -175,9 +181,15 @@ Produce a C2C PLAN message.
    "Please expand the plan with rationale and concrete per-file suggestions."
 4. Execute the plan yourself with your own harness (your tools, your judgment;
    ChatGPT does not micro-manage tool calls).
-5. Record the execution so ChatGPT can read it via MCP:
+5. Record the execution so ChatGPT can read it via MCP. For a Git workspace,
+   run the command from the registered task worktree; it acquires both persisted
+   leases and performs identity, branch, baseline and scope checks. Non-Git
+   workspaces retain the explicitly supported legacy record path:
    `c2c record -w <ws> --task c2c_f81a --iteration 1 --changed-files "src/a.ts,src/b.ts" --tests "27 passed" --exit-status ok`
-6. Send EXECUTED (no diffs, no logs):
+   If this fails, report `EXECUTED=NOT_SENT` and `C2C_STATE=BLOCKED`; never
+   claim an execution record was persisted.
+6. Send EXECUTED only after record persistence verification passes (no diffs,
+   no logs):
 
 ```
 [C2C]
