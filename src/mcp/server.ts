@@ -6,6 +6,7 @@ import { searchWorkspace } from "../workspace/search.js";
 import { gitDiff, gitInfo, gitStatus, type DiffMode } from "../workspace/git.js";
 import { latestExecutionRecord, readExecutionRecords } from "../execution/records.js";
 import { listExecutionOutputs, readExecutionOutput } from "../execution/output.js";
+import { findTaskRegistryByWorktree, readExecutionSummary } from "../task/isolation.js";
 import type { Logger } from "../logger/index.js";
 import { PRODUCT_NAME, VERSION } from "../version.js";
 
@@ -50,6 +51,7 @@ export interface McpContext {
 
 export function createMcpServer(ctx: McpContext): McpServer {
   const { workspace } = ctx;
+  const isolatedTask = findTaskRegistryByWorktree(workspace.root);
   const server = new McpServer(
     { name: PRODUCT_NAME, version: VERSION },
     { capabilities: { tools: {} }, instructions: UNTRUSTED_NOTE }
@@ -236,6 +238,14 @@ export function createMcpServer(ctx: McpContext): McpServer {
     async (_args, extra) => {
       const denied = requireScope(extra.authInfo, "execution.read");
       if (denied) return denied;
+      if (isolatedTask) {
+        const summary = readExecutionSummary(isolatedTask.taskId);
+        return ok({
+          available: Boolean(summary),
+          ...isolatedTask,
+          executionSummary: summary,
+        });
+      }
       const latest = latestExecutionRecord(workspace.id);
       if (!latest) {
         return ok({ available: false, message: "No execution records yet for this workspace." });
@@ -268,7 +278,15 @@ export function createMcpServer(ctx: McpContext): McpServer {
     async (args, extra) => {
       const denied = requireScope(extra.authInfo, "execution.read");
       if (denied) return denied;
-      return ok({ records: readExecutionRecords(workspace.id, args.limit) });
+      const records = readExecutionRecords(workspace.id, args.limit);
+      if (isolatedTask) {
+        return ok({
+          records,
+          taskRegistry: isolatedTask,
+          executionSummary: readExecutionSummary(isolatedTask.taskId),
+        });
+      }
+      return ok({ records });
     }
   );
 

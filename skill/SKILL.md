@@ -504,6 +504,11 @@ ChatGPT's replies are expected to be substantive (see step 3). Docs: `docs/proto
    reclaim**, then doctor again and only continue when the gate is green.
    Generate task id: `c2c_` + 4 random hex chars — unless a checkpoint already
    has one (reuse that id; do not mint a second task).
+   For a Git workspace, persist the task before code changes with
+   `c2c task create -w <workspace> --task <id> --baseline <HEAD> --allowed-files "..." --acceptance "..."`,
+   then run `c2c task verify -w <workspace> --worktree <task-worktree> --task <id>`.
+   A failed registration is fail-closed: do not modify files, run implementation
+   steps, or send EXECUTED.
 1. `c2c session -w <workspace> --json`. Open ChatGPT on the same iab tab
    per **Conversation management** for `conversation.mode` (foreground +
    markHandoff). long-chat: saved chat, or `https://chatgpt.com/` if none.
@@ -565,7 +570,10 @@ Produce a C2C PLAN message.
    ChatGPT does not micro-manage tool calls).
    Before you start:
    `c2c session set -w <ws> --protocol-state EXECUTING --waiting-for none --next-step "finish PLAN then record"`
-5. Record the execution so ChatGPT can read it via MCP. Metadata always:
+5. Record the execution so ChatGPT can read it via MCP. For a Git workspace,
+   run the command from the registered task worktree; it acquires both persisted
+   leases and performs identity, branch, baseline and scope checks. Non-Git
+   workspaces retain the explicitly supported legacy record path. Metadata:
    `c2c record -w <ws> --task c2c_f81a --iteration 1 --changed-files "src/a.ts,src/b.ts" --tests "27 passed" --exit-status ok`
    If this iteration ran a **test / build / lint / typecheck** command, also
    pass that command's output. Write stdout/stderr to a local temp file first,
@@ -573,6 +581,8 @@ Produce a C2C PLAN message.
    `c2c record … --command "pnpm test" --output-file <temp> --exit-code <n>`
    Record both success and failure. Do not record shell history, `.env`,
    keys, or unrelated dumps. Never paste that file (or any log) into ChatGPT.
+   If recording fails, report `EXECUTED=NOT_SENT` and `C2C_STATE=BLOCKED`; never
+   claim an execution record was persisted.
    If the CLI says the output was not released, still send EXECUTED; ChatGPT
    reviews from git. Then:
    `c2c session set -w <ws> --iteration 1 --state EXECUTED --protocol-state EXECUTED_LOCAL --waiting-for none --next-step "send EXECUTED"`

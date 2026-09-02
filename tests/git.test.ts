@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import path from "node:path";
-import { gitDiff, gitInfo, gitStatus } from "../src/workspace/git.js";
+import { parsePorcelainStatus, gitDiff, gitInfo, gitStatus } from "../src/workspace/git.js";
 import { makeTmpDir, cleanup, write, makeGitRepo, git } from "./helpers.js";
 
 let repo: string;
@@ -37,6 +37,21 @@ describe("gitInfo", () => {
   it("handles non-repos gracefully", () => {
     expect(gitInfo(plain).isRepo).toBe(false);
   });
+
+  it("does not classify a nested directory under a parent repo as its own repo", () => {
+    const nested = path.join(repo, "nested-fixture");
+    write(nested, "placeholder.txt", "nested\n");
+    expect(gitInfo(nested).isRepo).toBe(false);
+    expect(gitStatus(nested).isRepo).toBe(false);
+    cleanup(nested);
+  });
+
+  it("fails closed when a repository query cannot run", () => {
+    const missing = path.join(plain, "missing-cwd");
+    expect(() => gitInfo(missing)).toThrow("VERIFICATION_FAILED");
+    expect(() => gitStatus(missing)).toThrow("VERIFICATION_FAILED");
+    expect(() => gitDiff(missing, { mode: "unstaged" })).toThrow("VERIFICATION_FAILED");
+  });
 });
 
 describe("gitStatus", () => {
@@ -55,6 +70,24 @@ describe("gitStatus", () => {
 
     git(repo, "reset", "staged.txt");
     git(repo, "checkout", "--", "hello.txt");
+  });
+});
+
+describe("strict porcelain parsing", () => {
+  it("rejects malformed, truncated, unknown and incomplete rename records", () => {
+    expect(() => parsePorcelainStatus("?? missing-nul")).toThrow("GIT_STATUS_PARSE_FAILED");
+    expect(() => parsePorcelainStatus("X  unknown\0")).toThrow("GIT_STATUS_PARSE_FAILED");
+    expect(() => parsePorcelainStatus("?M  mixed\0")).toThrow("GIT_STATUS_PARSE_FAILED");
+    expect(() => parsePorcelainStatus("R  renamed\0")).toThrow("GIT_STATUS_PARSE_FAILED");
+  });
+
+  it("keeps ordinary untracked and ignored records separate", () => {
+    expect(parsePorcelainStatus("?? ordinary\0!! ignored\0")).toEqual({
+      tracked: [],
+      untracked: ["ordinary"],
+      ignored: ["ignored"],
+      conflicted: [],
+    });
   });
 });
 

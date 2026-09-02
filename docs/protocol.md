@@ -51,6 +51,30 @@ just to resume.
 Every control message starts with `[C2C]` and key-value headers, then sections.
 Keep messages < 1 KB. No diffs, no logs, no file bodies.
 
+## Task identity and persistence gates
+
+Before any coding-task modification, Codex must generate the task identity and
+persist it outside the Git worktree. Trading_Tools MAIN is never an execution
+root; create or register a dedicated worktree first:
+
+```text
+GENERATE TASK_ID
+→ c2c task create -w <workspace> --task <id> --baseline <HEAD> \
+  --allowed-files "..." --acceptance "..."
+→ c2c task verify -w <workspace> --worktree <task-worktree> --task <id>
+→ verify TASK_REGISTERED=YES WORKTREE_MATCH=YES BRANCH_MATCH=YES BASELINE_MATCH=YES
+→ only then modify code
+```
+
+The isolated task registry stores task id, workspace name/root/id, repository
+root/id, worktree root, task branch, pinned baseline, allowed files, acceptance
+commands, iteration and status under the state directory. Every execution must
+also acquire the task/worktree lease and pass the persisted identity checks.
+`c2c task scope` compares tracked diff and status against `allowed-files`; an
+outside tracked path is `SCOPE_VIOLATION`, and untracked paths are reported
+explicitly. A failed persistence, identity, lease or scope check is fail-closed:
+Codex must not modify MAIN or send `EXECUTED`.
+
 ### INIT (Codex → ChatGPT)
 
 ```
@@ -120,7 +144,8 @@ If execution_output lists a readable item for this iteration, list then read it.
 If status is restricted, ignore it and review from git_diff.
 ```
 
-Before sending EXECUTED, Codex records the iteration:
+Before sending EXECUTED, Codex records the iteration from the registered task
+worktree and waits for lease, scope and persistence verification to pass:
 `c2c record --task c2c_f81a --iteration 1 --changed-files ... --tests ... --exit-status ok`
 and, when a test/build/lint/typecheck was run, `--command` plus `--output-file`.
 ChatGPT reads metadata via `execution_summary` / `test_status`. Command output
@@ -129,6 +154,13 @@ the log; a **local sanitizer** decides whether ChatGPT may see the body
 (tokens/paths redacted; private keys withheld entirely; size/line caps).
 Restricted items appear in `list` with no body. Old records without output
 stay valid. Never paste logs into the control message.
+For Git workspaces it requires the matching registered task worktree, acquires
+both leases, checks identity and scope, persists the execution summary, then
+updates the registry to `status=EXECUTED`. Non-Git workspaces use the explicitly
+supported legacy JSONL record path. Only after persistence verification can
+ChatGPT read the result via `execution_summary` / `test_status` and Codex send
+`[C2C] EXECUTED`. If any check fails, the command exits non-zero and the
+protocol message is `[C2C] EXECUTED=NOT_SENT` with `C2C_STATE=BLOCKED`.
 
 ### DONE / BLOCKED (ChatGPT → Codex)
 
