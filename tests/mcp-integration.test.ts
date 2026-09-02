@@ -3,7 +3,7 @@ import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
-import { appendExecutionRecord } from "../src/execution/records.js";
+import { appendExecutionRecord, beginTask } from "../src/execution/records.js";
 import { saveExecutionOutput } from "../src/execution/output.js";
 import { makeTmpDir, cleanup, write, makeGitRepo, git, isolateStateDir } from "./helpers.js";
 
@@ -155,6 +155,16 @@ describe("MCP tools over Streamable HTTP", () => {
   });
 
   it("execution_summary and test_status read harness records", async () => {
+    beginTask({
+      taskId: "c2c_test1",
+      workspaceId: bridge.workspace.id,
+      workspaceRoot: bridge.workspace.root,
+      iteration: 0,
+      baselineHead: "test-baseline",
+      allowedFiles: ["src/index.ts"],
+      acceptanceCommands: ["pnpm test"],
+      stopConditions: ["test failure"],
+    });
     appendExecutionRecord(bridge.workspace.id, {
       taskId: "c2c_test1",
       iteration: 1,
@@ -162,7 +172,7 @@ describe("MCP tools over Streamable HTTP", () => {
       tests: "27 passed",
       exitStatus: "ok",
       timestamp: new Date().toISOString(),
-    });
+    }, bridge.workspace.root);
     const summary = jsonOf<{ records: { taskId: string }[] }>(
       await client.callTool({ name: "execution_summary", arguments: {} })
     );

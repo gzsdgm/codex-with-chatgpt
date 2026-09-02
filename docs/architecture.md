@@ -35,6 +35,9 @@
 - **MCP = data plane**: ChatGPT pulls files/diffs/search results itself.
 - **Read-only by design**: no write/exec tools exist in V1 at all.
 - **Workspace is the security boundary**: one bridge = one workspace = one token audience.
+- **Trading_Tools MAIN is audit-only**: mutation requests fail closed with `MAIN_WORKTREE_READ_ONLY`.
+- **Task work is isolated**: a coding task uses a persisted registry, one dedicated worktree, one task branch, and one pinned baseline HEAD.
+- **Git task lifecycle is canonical**: `task create`/`task register` → `task verify` → leased execution → persisted summary; non-Git legacy records remain explicitly separate.
 
 ## Components (src/)
 
@@ -45,8 +48,9 @@
 | `auth/` | OAuth 2.1 authorization server: discovery metadata (RFC 8414 + Protected Resource Metadata), dynamic client registration (RFC 7591), authorization-code + PKCE (S256 only), refresh rotation, revocation (RFC 7009). Opaque tokens stored as SHA-256 hashes |
 | `pairing/` | PairingCode lifecycle: CSPRNG generation, TTL, attempt limits, IP rate limit, one-time use |
 | `workspace/` | Canonical-path containment (realpath of deepest existing ancestor), sensitive-file policy, `.c2cignore`, paginated read/list, ripgrep search with Node fallback, git status/diff with pagination |
+| `task/` | Task registry and worktree identity gates, MAIN read-only gate, scope ownership, durable execution leases and summaries |
 | `tunnel/` | `TunnelProvider` interface + Cloudflare Quick and workspace-configured Named Tunnel implementations; business logic is vendor-agnostic |
-| `execution/` | JSONL execution records plus optional sanitized command output (`execution_output`) |
+| `execution/` | JSONL execution records plus optional sanitized command output (`execution_output`), read by `execution_summary` / `test_status` |
 | `process/` | Daemon spawn/reuse, health probing, graceful shutdown |
 | `cli/` | `c2c` commands; `--json` everywhere for the Skill |
 | `config/`, `logger/` | OS-convention state dir, secret-redacting logger |
