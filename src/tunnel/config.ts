@@ -76,15 +76,48 @@ function principalKey(principal: string): string {
   return slash >= 0 ? value.slice(slash + 1) : value;
 }
 
-function parseIcaclsPrincipals(output: string): string[] {
-  const principals: string[] = [];
+const ACE_FLAGS = new Set(["I", "OI", "CI", "IO", "NP"]);
+const ACE_PERMISSIONS = new Set(["F", "M", "W", "R", "RX"]);
+
+interface ParsedAce {
+  principal: string;
+  flags: string[];
+  permission: string;
+}
+
+function isIcaclsSummary(line: string): boolean {
+  return /^(successfully processed|failed processing|已成功处理|处理失败)\b/i.test(line);
+}
+
+function parseIcaclsAce(line: string, tokenFile: string): ParsedAce | null {
+  const normalized = line.toLowerCase();
+  const tokenPrefix = tokenFile.trim().toLowerCase();
+  if (normalized.startsWith(tokenPrefix)) line = line.slice(tokenFile.trim().length).trim();
+
+  const markerIndex = line.search(/:\s*\(/);
+  if (markerIndex <= 0) return null;
+  const principal = line.slice(0, markerIndex).trim();
+  const markerText = line.slice(markerIndex + 1).trim();
+  const markers = Array.from(markerText.matchAll(/\(([^()]*)\)/g), (match) => match[1].trim().toUpperCase());
+  const normalizedMarkers = markers.map((marker) => `(${marker})`).join("");
+  if (!principal || markers.length === 0 || markerText.replace(/\s+/g, "").toUpperCase() !== normalizedMarkers) return null;
+
+  const unknown = markers.filter((marker) => !ACE_FLAGS.has(marker) && !ACE_PERMISSIONS.has(marker));
+  const permissions = markers.filter((marker) => ACE_PERMISSIONS.has(marker));
+  if (unknown.length > 0 || permissions.length !== 1) return null;
+  return { principal, flags: markers.filter((marker) => ACE_FLAGS.has(marker)), permission: permissions[0] };
+}
+
+function parseIcaclsAces(output: string, tokenFile: string): ParsedAce[] | "malformed" | null {
+  const aces: ParsedAce[] = [];
   for (const raw of output.split(/\r?\n/)) {
     const line = raw.trim();
-    if (!line || /^(successfully processed|已成功处理)/i.test(line)) continue;
-    const withoutAce = line.replace(/:\([^)]*\)\s*$/, "").trim();
-    if (withoutAce) principals.push(withoutAce.split(/\s+/).at(-1) ?? withoutAce);
+    if (!line || isIcaclsSummary(line)) continue;
+    const ace = parseIcaclsAce(line, tokenFile);
+    if (!ace) return aces.length > 0 ? "malformed" : null;
+    aces.push(ace);
   }
-  return principals;
+  return aces.length > 0 ? aces : null;
 }
 
 export interface TokenFileReport {
@@ -94,6 +127,36 @@ export interface TokenFileReport {
   secure: boolean;
   detail: string;
   problems: string[];
+}
+
+export interface IcaclsInspectionResult {
+  status: number | null;
+  stdout: string | null;
+  error?: unknown;
+}
+
+function aclFailure(detail: string, problem: string): Pick<TokenFileReport, "secure" | "detail" | "problems"> {
+  return { secure: false, detail, problems: [problem] };
+}
+
+/** Validate a completed icacls result without reading token-file contents. */
+export function inspectWindowsTokenFileAcl(
+  tokenFile: string,
+  result: IcaclsInspectionResult
+): Pick<TokenFileReport, "secure" | "detail" | "problems"> {
+  if (result.error || result.status !== 0) {
+    return aclFailure("could not inspect token file ACL", "ACL_INSPECTION_FAILED");
+  }
+  if (!result.stdout?.trim()) return aclFailure("token file ACL output is empty", "ACL_OUTPUT_EMPTY");
+  const aces = parseIcaclsAces(result.stdout, tokenFile);
+  if (aces === "malformed") return aclFailure("token file ACL entry is unparseable", "ACL_ENTRY_UNPARSEABLE");
+  if (!aces) return aclFailure("token file ACL output is unparseable", "ACL_OUTPUT_UNPARSEABLE");
+
+  const broad = aces.filter((ace) => BROAD_PRINCIPALS.has(principalKey(ace.principal)));
+  if (broad.length > 0) {
+    return aclFailure("token file ACL is too permissive", "ACL_BROAD_PRINCIPAL");
+  }
+  return { secure: true, detail: "token file ACL is restricted", problems: [] };
 }
 
 /** Inspect metadata only. The token-file contents are never opened or read. */
@@ -145,33 +208,16 @@ export function inspectTokenFile(tokenFile: string | undefined): TokenFileReport
 
   if (process.platform === "win32") {
     const acl = spawnSync("icacls", [tokenFile], { encoding: "utf8", timeout: 10_000 });
-    const output = `${acl.stdout ?? ""}${acl.stderr ?? ""}`;
-    if (!output.trim()) {
-      return {
-        ...missing,
-        exists: true,
-        regularFile: true,
-        detail: "could not read token file ACL",
-        problems: [],
-      };
-    }
-    const broad = parseIcaclsPrincipals(output).filter((principal) => BROAD_PRINCIPALS.has(principalKey(principal)));
-    if (broad.length > 0) {
-      return {
-        ...missing,
-        exists: true,
-        regularFile: true,
-        detail: "token file ACL is too permissive",
-        problems: [],
-      };
-    }
+    const aclReport = inspectWindowsTokenFileAcl(tokenFile, {
+      status: acl.status,
+      stdout: typeof acl.stdout === "string" ? acl.stdout : null,
+      error: acl.error,
+    });
     return {
       ...missing,
       exists: true,
       regularFile: true,
-      secure: true,
-      detail: "token file ACL is restricted",
-      problems: [],
+      ...aclReport,
     };
   }
 

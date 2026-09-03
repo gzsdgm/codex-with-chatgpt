@@ -9,6 +9,7 @@ import {
   buildChildEnv,
   buildNamedTunnelArgs,
   inspectTokenFile,
+  inspectWindowsTokenFileAcl,
   namedTunnelProblems,
   resolveTunnelConfig,
   type TunnelConfig,
@@ -18,6 +19,7 @@ import { cleanup, makeTmpDir, write } from "./helpers.js";
 
 const TOKEN = "token-file-secret-that-must-not-leak";
 const HOSTNAME = "c2c.example.test";
+const ACL_FILE = "C:\\secret.token";
 const dirs: string[] = [];
 
 class FakeChild extends EventEmitter {
@@ -60,6 +62,54 @@ afterEach(() => {
 });
 
 describe("token-file named tunnel configuration", () => {
+  it("accepts a restricted ACL with inherited and propagation markers", () => {
+    const report = inspectWindowsTokenFileAcl(ACL_FILE, {
+      status: 0,
+      stdout: [
+        `${ACL_FILE} G260618\\guanz:(I)(F)`,
+        "NT AUTHORITY\\SYSTEM:(OI)(CI)(F)",
+        "Successfully processed 1 files; Failed processing 0 files",
+      ].join("\r\n"),
+    });
+    expect(report).toEqual({ secure: true, detail: "token file ACL is restricted", problems: [] });
+  });
+
+  it("rejects broad principals with all supported marker layouts and write permissions", () => {
+    for (const ace of [
+      "Everyone:(F)",
+      "Everyone:(I)(F)",
+      "Everyone:(OI)(CI)(F)",
+      "BUILTIN\\Users:(I)(M)",
+      "Everyone:(W)",
+    ]) {
+      const report = inspectWindowsTokenFileAcl(ACL_FILE, { status: 0, stdout: `${ACL_FILE} ${ace}\r\n` });
+      expect(report.secure, ace).toBe(false);
+      expect(report.problems, ace).toContain("ACL_BROAD_PRINCIPAL");
+    }
+  });
+
+  it("fails closed for icacls failures, empty output, absent ACEs, and malformed or partial ACEs", () => {
+    const cases = [
+      { result: { status: null, stdout: null, error: new Error("spawn failed") }, problem: "ACL_INSPECTION_FAILED" },
+      { result: { status: 1, stdout: "" }, problem: "ACL_INSPECTION_FAILED" },
+      { result: { status: 0, stdout: "" }, problem: "ACL_OUTPUT_EMPTY" },
+      { result: { status: 0, stdout: "Successfully processed 1 files; Failed processing 0 files" }, problem: "ACL_OUTPUT_UNPARSEABLE" },
+      {
+        result: { status: 0, stdout: `${ACL_FILE} G260618\\guanz:(I)(F)\r\nEveryone:(I)(UNKNOWN)` },
+        problem: "ACL_ENTRY_UNPARSEABLE",
+      },
+      {
+        result: { status: 0, stdout: `${ACL_FILE} G260618\\guanz:(I)(F)\r\nnot-an-ace` },
+        problem: "ACL_ENTRY_UNPARSEABLE",
+      },
+    ];
+    for (const testCase of cases) {
+      const report = inspectWindowsTokenFileAcl(ACL_FILE, testCase.result);
+      expect(report.secure, testCase.problem).toBe(false);
+      expect(report.problems, testCase.problem).toContain(testCase.problem);
+    }
+  });
+
   it("maps C2C_TUNNEL_* values without reading the token", () => {
     const file = tokenFile();
     const resolved = resolveTunnelConfig({
