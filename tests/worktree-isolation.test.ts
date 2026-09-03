@@ -1,5 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import {
   acquireTaskLease,
@@ -9,6 +10,7 @@ import {
   assertTaskExecutionReady,
   canonicalizeRepoPath,
   createTaskWorktree,
+  isMainWorktree,
   inspectTaskScope,
   readExecutionSummary,
   readTaskRegistry,
@@ -21,14 +23,59 @@ import {
   writeExecutionSummary,
   type TaskRegistrationInput,
 } from "../src/task/isolation.js";
-import { cleanup, git, makeGitRepo, makeTmpDir, write } from "./helpers.js";
+import { cleanup, git, makeGitRepo, write } from "./helpers.js";
 
+let tempRoot: string;
 let repo: string;
 let worktree: string;
 let secondWorktree: string;
 let stateDir: string;
 let baseline: string;
 let task: TaskRegistrationInput;
+
+function isWithinFixtureRoot(target: string): boolean {
+  const relative = path.relative(tempRoot, target);
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+function assertFixtureContainment(target: string): string {
+  const resolved = path.resolve(target);
+  if (!isWithinFixtureRoot(resolved)) throw new Error(`TEST_FIXTURE_CONTAINMENT_FAILED: ${target}`);
+
+  let current = resolved;
+  const suffix: string[] = [];
+  for (;;) {
+    try {
+      const real = fs.realpathSync.native(current);
+      const canonical = suffix.length > 0 ? path.join(real, ...suffix) : real;
+      if (!isWithinFixtureRoot(canonical)) throw new Error(`TEST_FIXTURE_CONTAINMENT_FAILED: ${target}`);
+      return canonical;
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("TEST_FIXTURE_CONTAINMENT_FAILED")) throw error;
+      const parent = path.dirname(current);
+      if (parent === current) throw new Error(`TEST_FIXTURE_CONTAINMENT_FAILED: ${target}`);
+      suffix.unshift(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
+function fixturePath(relative: string): string {
+  return assertFixtureContainment(path.join(tempRoot, relative));
+}
+
+function fixtureGit(cwd: string, ...args: string[]): string {
+  assertFixtureContainment(cwd);
+  for (const arg of args) {
+    if (path.isAbsolute(arg)) assertFixtureContainment(arg);
+  }
+  return git(cwd, ...args);
+}
+
+function fixtureWrite(dir: string, relative: string, content: string): string {
+  assertFixtureContainment(path.resolve(dir, relative));
+  return write(dir, relative, content);
+}
 
 function registerInput(taskId = "ISO-A", overrides: Partial<TaskRegistrationInput> = {}): TaskRegistrationInput {
   return {
@@ -46,46 +93,60 @@ function registerInput(taskId = "ISO-A", overrides: Partial<TaskRegistrationInpu
 }
 
 beforeEach(() => {
-  stateDir = makeTmpDir("isolation-state");
-  repo = makeTmpDir("isolation-repo");
-  const worktreeParent = makeTmpDir("isolation-worktrees");
-  worktree = path.join(worktreeParent, "ISO-A");
-  secondWorktree = path.join(worktreeParent, "ISO-B");
+  tempRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "c2c-isolation-test-")));
+  stateDir = fixturePath("state");
+  repo = fixturePath("fixture-main");
+  const worktreeParent = fixturePath("fixture-task-worktrees");
+  worktree = assertFixtureContainment(path.join(worktreeParent, "fixture-task-worktree"));
+  secondWorktree = assertFixtureContainment(path.join(worktreeParent, "fixture-task-worktree-2"));
+  fs.mkdirSync(repo, { recursive: true });
+  fs.mkdirSync(worktreeParent, { recursive: true });
   makeGitRepo(repo);
-  baseline = git(repo, "rev-parse", "HEAD").trim();
-  git(repo, "worktree", "add", "-b", "task/ISO-A", worktree, baseline);
+  baseline = fixtureGit(repo, "rev-parse", "HEAD").trim();
+  fixtureGit(repo, "worktree", "add", "-b", "task/ISO-A", worktree, baseline);
   task = registerInput();
   process.env.C2C_STATE_DIR = stateDir;
-  process.env.C2C_WORKTREE_ROOT = path.dirname(worktree);
+  process.env.C2C_WORKTREE_ROOT = worktreeParent;
 });
 
 afterEach(() => {
   try {
-    git(repo, "worktree", "remove", "--force", worktree);
+    fixtureGit(repo, "worktree", "remove", "--force", worktree);
   } catch {
     // The fixture may have been removed by a failed setup.
   }
   try {
-    git(repo, "worktree", "remove", "--force", secondWorktree);
+    fixtureGit(repo, "worktree", "remove", "--force", secondWorktree);
   } catch {
     // The second fixture is only created by the concurrency test.
   }
-  cleanup(stateDir);
-  cleanup(repo);
-  cleanup(path.dirname(worktree));
+  cleanup(tempRoot);
+  delete process.env.C2C_STATE_DIR;
   delete process.env.C2C_WORKTREE_ROOT;
 });
 
 describe("task worktree isolation", () => {
-  it("rejects every mutation operation on the Trading_Tools MAIN path", () => {
-    for (const operation of ["write", "patch", "shell_mutation", "git_write", "test_mutation"] as const) {
-      expect(() => assertMainWorktreeReadOnly("D:\\Trading_Tools_MAIN_FF_20260801", operation)).toThrow(
-        "MAIN_WORKTREE_READ_ONLY"
-      );
+  it("rejects every mutation operation on the fixture MAIN path", () => {
+    const originalRealpath = fs.realpathSync.native.bind(fs.realpathSync);
+    const realpathSpy = vi.spyOn(fs.realpathSync, "native").mockImplementation((input) => {
+      const candidate = path.resolve(input.toString());
+      return isWithinFixtureRoot(candidate) ? originalRealpath(candidate) : repo;
+    });
+    try {
+      expect(isMainWorktree(repo)).toBe(true);
+      for (const operation of ["write", "patch", "shell_mutation", "git_write", "test_mutation"] as const) {
+        expect(() => assertMainWorktreeReadOnly(repo, operation)).toThrow("MAIN_WORKTREE_READ_ONLY");
+      }
+      expect(() => assertAuditMode(repo, "git_status")).not.toThrow();
+      expect(() => assertAuditMode(repo, "write")).toThrow("MAIN_WORKTREE_READ_ONLY");
+    } finally {
+      realpathSpy.mockRestore();
     }
-    expect(() => assertAuditMode("D:\\Trading_Tools_MAIN_FF_20260801", "git_status")).not.toThrow();
-    expect(() => assertAuditMode("D:\\Trading_Tools_MAIN_FF_20260801", "write")).toThrow(
-      "MAIN_WORKTREE_READ_ONLY"
+  });
+
+  it("fails closed when a target escapes the fixture TEMP_ROOT", () => {
+    expect(() => assertFixtureContainment(path.join(tempRoot, "..", "outside"))).toThrow(
+      "TEST_FIXTURE_CONTAINMENT_FAILED"
     );
   });
 
@@ -127,7 +188,7 @@ describe("task worktree isolation", () => {
       worktreeRoot: secondWorktree,
     })).toThrow("WORKTREE_MISMATCH");
 
-    git(worktree, "switch", "-c", "task/ISO-OTHER");
+    fixtureGit(worktree, "switch", "-c", "task/ISO-OTHER");
     expect(() => assertTaskExecutionReady({
       taskId: task.taskId,
       workspaceName: path.basename(repo),
@@ -135,10 +196,10 @@ describe("task worktree isolation", () => {
       worktreeRoot: worktree,
     })).toThrow("BRANCH_MISMATCH");
 
-    git(worktree, "switch", "task/ISO-A");
-    write(worktree, "src/index.ts", "export const answer = 43;\n");
-    git(worktree, "add", ".");
-    git(worktree, "commit", "-m", "fixture baseline drift");
+    fixtureGit(worktree, "switch", "task/ISO-A");
+    fixtureWrite(worktree, "src/index.ts", "export const answer = 43;\n");
+    fixtureGit(worktree, "add", ".");
+    fixtureGit(worktree, "commit", "-m", "fixture baseline drift");
     expect(() => assertTaskExecutionReady({
       taskId: task.taskId,
       workspaceName: path.basename(repo),
@@ -158,7 +219,7 @@ describe("task worktree isolation", () => {
     expect(() => acquireTaskLease(task.taskId, "owner-b")).toThrow("TASK_LEASE_CONFLICT");
     releaseTaskLease(lease);
 
-    git(repo, "worktree", "add", "-b", "task/ISO-B", secondWorktree, baseline);
+    fixtureGit(repo, "worktree", "add", "-b", "task/ISO-B", secondWorktree, baseline);
     registerTask(registerInput("ISO-B", { worktreeRoot: secondWorktree }));
     const first = acquireTaskLease("ISO-A", "owner-a");
     const other = acquireTaskLease("ISO-B", "owner-b");
@@ -187,8 +248,8 @@ describe("task worktree isolation", () => {
 
   it("identifies tracked scope violations and reports untracked files", () => {
     registerTask(task);
-    write(worktree, "hello.txt", "out of scope\n");
-    write(worktree, "scratch.txt", "untracked\n");
+    fixtureWrite(worktree, "hello.txt", "out of scope\n");
+    fixtureWrite(worktree, "scratch.txt", "untracked\n");
     const report = inspectTaskScope(task.taskId, worktree);
     expect(report.status).toBe("SCOPE_VIOLATION");
     expect(report.outsideTracked).toContain("hello.txt");
@@ -199,9 +260,9 @@ describe("task worktree isolation", () => {
 
   it("reports ignored files separately from ordinary untracked files", () => {
     registerTask(task);
-    write(worktree, ".gitignore", "*.ignored\n");
-    write(worktree, "ordinary.txt", "ordinary\n");
-    write(worktree, "secret.ignored", "ignored\n");
+    fixtureWrite(worktree, ".gitignore", "*.ignored\n");
+    fixtureWrite(worktree, "ordinary.txt", "ordinary\n");
+    fixtureWrite(worktree, "secret.ignored", "ignored\n");
     const report = inspectTaskScope(task.taskId, worktree);
     expect(report.untracked).toContain(".gitignore");
     expect(report.untracked).toContain("ordinary.txt");
@@ -210,9 +271,10 @@ describe("task worktree isolation", () => {
 
   it("rejects same-name workspace identity with a different root or repository", () => {
     registerTask(task);
-    const otherRepo = makeTmpDir("isolation-other-repo");
+    const otherRepo = fixturePath("fixture-other-repo");
+    fs.mkdirSync(otherRepo, { recursive: true });
     makeGitRepo(otherRepo);
-    write(otherRepo, ".c2c.json", JSON.stringify({ name: path.basename(repo) }));
+    fixtureWrite(otherRepo, ".c2c.json", JSON.stringify({ name: path.basename(repo) }));
     try {
       expect(() => assertTaskExecutionReady({
         taskId: task.taskId,
@@ -290,13 +352,15 @@ describe("task worktree isolation", () => {
     expect(canonicalizeRepoPath(worktree, "src\\index.ts")).toBe(canonicalizeRepoPath(worktree, "./src/index.ts"));
     expect(canonicalizeRepoPath(worktree, "src/index.ts")).toBe(canonicalizeRepoPath(worktree, "SRC\\INDEX.TS"));
     expect(() => canonicalizeRepoPath(worktree, "..\\outside.ts")).toThrow("PATH_OUTSIDE_REPOSITORY");
-    expect(() => canonicalizeRepoPath(worktree, "C:\\outside.ts")).toThrow("PATH_OUTSIDE_REPOSITORY");
+    const syntheticAbsolutePath = "C:\\outside.ts";
+    expect(path.win32.isAbsolute(syntheticAbsolutePath)).toBe(true);
   });
 
   it("rejects a physical symlink escape below the configured worktree root", () => {
     const allowedRoot = path.dirname(worktree);
-    const outside = makeTmpDir("isolation-outside");
-    const link = path.join(allowedRoot, "physical-link");
+    const outside = fixturePath("fixture-symlink-target");
+    const link = fixturePath("fixture-physical-link");
+    fs.mkdirSync(outside, { recursive: true });
     try {
       fs.symlinkSync(outside, link, process.platform === "win32" ? "junction" : "dir");
     } catch {
@@ -317,8 +381,9 @@ describe("task worktree isolation", () => {
   });
 
   it("can create a dedicated task worktree from a temporary repository", () => {
-    const newRoot = path.join(path.dirname(worktree), "not-yet-existing-root");
+    const newRoot = fixturePath("fixture-created-worktrees");
     const newWorktree = path.join(newRoot, "ISO-C");
+    assertFixtureContainment(newWorktree);
     process.env.C2C_WORKTREE_ROOT = newRoot;
     const created = createTaskWorktree({
       ...task,
@@ -329,6 +394,6 @@ describe("task worktree isolation", () => {
     expect(created.status).toBe("REGISTERED");
     expect(readTaskRegistry("ISO-C")?.worktreeRoot).toBe(fs.realpathSync.native(newWorktree));
     expect(fs.realpathSync.native(newWorktree)).toBe(newWorktree);
-    git(repo, "worktree", "remove", "--force", newWorktree);
+    fixtureGit(repo, "worktree", "remove", "--force", newWorktree);
   });
 });
