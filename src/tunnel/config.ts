@@ -20,7 +20,8 @@ export interface TunnelConfig {
   };
 }
 
-const HOSTNAME_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/;
+const HOSTNAME_RE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i;
+const TUNNEL_NAME_MAX_LENGTH = 128;
 const BROAD_PRINCIPALS = new Set([
   "everyone",
   "authenticated users",
@@ -59,9 +60,14 @@ export function resolveTunnelConfig(env: NodeJS.ProcessEnv = process.env): Tunne
   };
 }
 
+export function normalizeNamedTunnelName(input: string | undefined): string | null {
+  const value = input?.trim() ?? "";
+  return value.length >= 1 && value.length <= TUNNEL_NAME_MAX_LENGTH ? value : null;
+}
+
 export function normalizeHostname(input: string | undefined): string | null {
   if (!input) return null;
-  const value = input.trim().replace(/^https?:\/\//i, "").split(/[/?#]/)[0].replace(/\.$/, "").toLowerCase();
+  const value = input.trim().replace(/\.$/, "").toLowerCase();
   return HOSTNAME_RE.test(value) ? value : null;
 }
 
@@ -247,7 +253,9 @@ export function tokenFileProblems(tokenFile: string | undefined): string[] {
 
 export function namedTunnelProblems(config: TunnelConfig): string[] {
   const problems: string[] = [];
-  if (!config.named.name?.trim()) problems.push("C2C_TUNNEL_NAME is required in named mode");
+  if (!normalizeNamedTunnelName(config.named.name)) {
+    problems.push("Named tunnel name must be between 1 and 128 characters");
+  }
   if (!normalizeHostname(config.named.hostname)) {
     problems.push("C2C_TUNNEL_HOSTNAME is required in named mode");
   }

@@ -9,7 +9,8 @@ import {
   parseQuickTunnelUrl,
   type CloudflaredQuickTunnelOptions,
 } from "../src/tunnel/cloudflared.js";
-import { normalizeNamedTunnelHostname } from "../src/tunnel/cloudflared-named.js";
+import { CloudflaredNamedTunnel, normalizeNamedTunnelHostname } from "../src/tunnel/cloudflared-named.js";
+import { namedTunnelProblems, type TunnelConfig } from "../src/tunnel/config.js";
 import { hostnameSlug, parseZoneInput, suggestedNamedHostname } from "../src/tunnel/hostname.js";
 import {
   chooseQuickTunnel,
@@ -211,6 +212,57 @@ describe("normalizeNamedTunnelHostname", () => {
   it("rejects URLs and invalid hostnames", () => {
     expect(() => normalizeNamedTunnelHostname("https://dev.getremi.xyz")).toThrow(/invalid/i);
     expect(() => normalizeNamedTunnelHostname("localhost")).toThrow(/invalid/i);
+  });
+
+  it("keeps upstream tunnel-name length bounds in provider and config validation", () => {
+    const hostname = "c2c.example.com";
+    const makeConfig = (name: string): TunnelConfig => ({
+      mode: "named",
+      protocol: "auto",
+      named: { name, hostname },
+    });
+    for (const name of ["x", "x".repeat(128)]) {
+      expect(() => new CloudflaredNamedTunnel({ tunnelName: name, hostname })).not.toThrow();
+      expect(namedTunnelProblems(makeConfig(name))).toEqual([]);
+    }
+    for (const name of ["", "   ", "x".repeat(129)]) {
+      expect(() => new CloudflaredNamedTunnel({ tunnelName: name, hostname })).toThrow(
+        "Named tunnel name must be between 1 and 128 characters"
+      );
+      expect(namedTunnelProblems(makeConfig(name))).toContain("Named tunnel name must be between 1 and 128 characters");
+    }
+  });
+
+  it("keeps upstream hostname validation identical in provider and config", () => {
+    const makeConfig = (hostname: string): TunnelConfig => ({
+      mode: "named",
+      protocol: "auto",
+      named: { name: "c2c-production", hostname },
+    });
+    for (const hostname of ["c2c.example.com", "foo-bar.example.com", "C2C.EXAMPLE.COM."]) {
+      const normalized = normalizeNamedTunnelHostname(hostname);
+      expect(namedTunnelProblems(makeConfig(hostname))).toEqual([]);
+      expect(() => new CloudflaredNamedTunnel({ tunnelName: "c2c-production", hostname })).not.toThrow();
+      expect(normalized).toMatch(/^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/);
+    }
+    const invalid = [
+      "localhost",
+      "foo",
+      "foo..example.com",
+      "-foo.example.com",
+      "foo-.example.com",
+      "foo_bar.example.com",
+      "foo.123",
+      `${"a".repeat(64)}.example.com`,
+      `${["a", "b", "c", "d"].map((label) => label.repeat(63)).join(".")}.com`,
+      "foo.c",
+      `foo.${"a".repeat(64)}`,
+    ];
+    for (const hostname of invalid) {
+      expect(() => normalizeNamedTunnelHostname(hostname), hostname).toThrow(/invalid/i);
+      expect(namedTunnelProblems(makeConfig(hostname)), hostname).toContain("C2C_TUNNEL_HOSTNAME is required in named mode");
+      expect(() => new CloudflaredNamedTunnel({ tunnelName: "c2c-production", hostname }), hostname).toThrow(/invalid/i);
+    }
   });
 });
 

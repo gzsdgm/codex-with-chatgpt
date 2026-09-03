@@ -7,6 +7,8 @@ import type { TunnelDoctorReport, TunnelProvider, TunnelStatus } from "./provide
 import {
   buildChildEnv,
   buildNamedTunnelArgs,
+  normalizeHostname,
+  normalizeNamedTunnelName,
   namedTunnelProblems,
   namedTunnelPublicUrl,
   type TunnelConfig,
@@ -14,7 +16,6 @@ import {
 } from "./config.js";
 
 const CONNECTED_RE = /registered tunnel connection/i;
-const HOSTNAME_RE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i;
 
 export interface CloudflaredNamedTunnelOptions {
   tunnelName?: string;
@@ -28,8 +29,8 @@ export interface CloudflaredNamedTunnelOptions {
 }
 
 export function normalizeNamedTunnelHostname(hostname: string): string {
-  const normalized = hostname.trim().toLowerCase().replace(/\.$/, "");
-  if (!HOSTNAME_RE.test(normalized)) {
+  const normalized = normalizeHostname(hostname);
+  if (!normalized) {
     throw new Error(`Invalid named tunnel hostname: ${hostname}`);
   }
   return normalized;
@@ -54,10 +55,26 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
   private lastError: string | null = null;
 
   constructor(opts: CloudflaredNamedTunnelOptions) {
+    let tunnelName: string | undefined;
+    if (opts.tunnelName !== undefined) {
+      const normalizedName = normalizeNamedTunnelName(opts.tunnelName);
+      if (!normalizedName) {
+        throw new Error("Named tunnel name must be between 1 and 128 characters");
+      }
+      tunnelName = normalizedName;
+    }
+    let hostname: string | undefined;
+    if (opts.hostname !== undefined) {
+      const normalizedHostname = normalizeHostname(opts.hostname);
+      if (!normalizedHostname) {
+        throw new Error(`Invalid named tunnel hostname: ${opts.hostname}`);
+      }
+      hostname = normalizedHostname;
+    }
     this.config = {
       mode: "named",
       protocol: opts.protocol ?? "auto",
-      named: { name: opts.tunnelName?.trim(), hostname: opts.hostname, tokenFile: opts.tokenFile },
+      named: { name: tunnelName, hostname, tokenFile: opts.tokenFile },
     };
     this.logger = opts.logger ?? nullLogger;
     this.binaryOverride = opts.binaryOverride;
