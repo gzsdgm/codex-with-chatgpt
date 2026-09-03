@@ -4,16 +4,27 @@ import type { Logger } from "../logger/index.js";
 import { nullLogger } from "../logger/index.js";
 import { findBinary } from "./detect.js";
 import type { TunnelDoctorReport, TunnelProvider, TunnelStatus } from "./provider.js";
+import {
+  buildChildEnv,
+  buildNamedTunnelArgs,
+  namedTunnelProblems,
+  namedTunnelPublicUrl,
+  type TunnelConfig,
+  type SpawnOptions,
+} from "./config.js";
 
 const CONNECTED_RE = /registered tunnel connection/i;
 const HOSTNAME_RE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i;
 
 export interface CloudflaredNamedTunnelOptions {
-  tunnelName: string;
-  hostname: string;
+  tunnelName?: string;
+  hostname?: string;
+  tokenFile?: string;
+  protocol?: TunnelConfig["protocol"];
   logger?: Logger;
   binaryOverride?: string;
   startTimeoutMs?: number;
+  spawnFn?: (command: string, args: string[], options: SpawnOptions) => ChildProcess;
 }
 
 export function normalizeNamedTunnelHostname(hostname: string): string {
@@ -33,25 +44,25 @@ export function normalizeNamedTunnelHostname(hostname: string): string {
  */
 export class CloudflaredNamedTunnel implements TunnelProvider {
   readonly name = "cloudflare-named";
-  private readonly tunnelName: string;
-  private readonly hostname: string;
+  private readonly config: TunnelConfig;
   private readonly logger: Logger;
   private readonly binaryOverride?: string;
   private readonly startTimeoutMs: number;
+  private readonly spawnFn: NonNullable<CloudflaredNamedTunnelOptions["spawnFn"]>;
   private child: ChildProcess | null = null;
   private connected = false;
   private lastError: string | null = null;
 
   constructor(opts: CloudflaredNamedTunnelOptions) {
-    const tunnelName = opts.tunnelName.trim();
-    if (!tunnelName || tunnelName.length > 128) {
-      throw new Error("Named tunnel name must be between 1 and 128 characters");
-    }
-    this.tunnelName = tunnelName;
-    this.hostname = normalizeNamedTunnelHostname(opts.hostname);
+    this.config = {
+      mode: "named",
+      protocol: opts.protocol ?? "auto",
+      named: { name: opts.tunnelName?.trim(), hostname: opts.hostname, tokenFile: opts.tokenFile },
+    };
     this.logger = opts.logger ?? nullLogger;
     this.binaryOverride = opts.binaryOverride;
     this.startTimeoutMs = opts.startTimeoutMs ?? 45_000;
+    this.spawnFn = opts.spawnFn ?? ((command, args, options) => spawn(command, args, options));
   }
 
   private binary(): string | null {
@@ -59,11 +70,15 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
   }
 
   private publicUrl(): string {
-    return `https://${this.hostname}`;
+    return namedTunnelPublicUrl(this.config)!;
   }
 
   async start(localPort: number): Promise<string> {
     if (this.child && this.connected) return this.publicUrl();
+    const problems = namedTunnelProblems(this.config);
+    if (problems.length > 0) {
+      throw new Error(`NEED_NAMED_TUNNEL_CONFIG: ${problems.join("; ")}`);
+    }
     const bin = this.binary();
     if (!bin) {
       throw new Error(
@@ -71,19 +86,17 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
       );
     }
 
+    const args = buildNamedTunnelArgs(this.config, localPort);
+    const env = buildChildEnv(this.config);
     return new Promise<string>((resolve, reject) => {
-      const child = spawn(
-        bin,
-        [
-          "tunnel",
-          "--no-autoupdate",
-          "--url",
-          `http://127.0.0.1:${localPort}`,
-          "run",
-          this.tunnelName,
-        ],
-        { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }
-      );
+      let child: ChildProcess;
+      try {
+        child = this.spawnFn(bin, args, { stdio: ["ignore", "pipe", "pipe"], env, windowsHide: true });
+      } catch (error) {
+        this.lastError = `cloudflared failed to start: ${(error as Error).message}`;
+        reject(new Error(this.lastError));
+        return;
+      }
       this.child = child;
       this.connected = false;
       this.lastError = null;
@@ -99,6 +112,7 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
         if (!this.connected) {
           this.lastError = "Named tunnel start timed out";
           child.kill("SIGTERM");
+          this.child = null;
           finish(() => reject(new Error(this.lastError ?? "Named tunnel start timed out")));
         }
       }, this.startTimeoutMs);
@@ -113,8 +127,8 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
             finish(() => resolve(url));
           }
           if (/\b(error|failed|fatal)\b/i.test(line)) {
-            this.lastError = line.slice(0, 400);
-            this.logger.debug(`cloudflared: ${line.slice(0, 400)}`);
+            this.lastError = "cloudflared reported an error";
+            this.logger.debug(this.lastError);
           }
         });
       };
@@ -124,7 +138,7 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
       child.on("error", (error) => {
         this.child = null;
         this.connected = false;
-        finish(() => reject(error));
+        finish(() => reject(new Error(`cloudflared failed to start: ${error.message}`)));
       });
       child.on("exit", (code) => {
         const wasStarting = !this.connected;

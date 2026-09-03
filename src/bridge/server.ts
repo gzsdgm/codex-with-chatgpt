@@ -12,17 +12,22 @@ import { CloudflaredQuickTunnel } from "../tunnel/cloudflared.js";
 import { CloudflaredNamedTunnel } from "../tunnel/cloudflared-named.js";
 import type { TunnelProvider } from "../tunnel/provider.js";
 import { namedTunnelBinding, readTunnelState } from "../tunnel/state.js";
+import { resolveTunnelConfig } from "../tunnel/config.js";
 import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 import { writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
 
 function tunnelForWorkspace(workspaceId: string, logger: Logger): TunnelProvider {
+  const configured = resolveTunnelConfig();
   const binding = namedTunnelBinding(readTunnelState(workspaceId));
-  if (binding) {
+  if (configured.mode === "quick") return new CloudflaredQuickTunnel(logger);
+  if (configured.mode === "named" || binding || configured.named.name || configured.named.hostname || configured.named.tokenFile) {
     return new CloudflaredNamedTunnel({
-      tunnelName: binding.tunnelName,
-      hostname: binding.hostname,
+      tunnelName: configured.named.name ?? binding?.tunnelName,
+      hostname: configured.named.hostname ?? binding?.hostname,
+      tokenFile: configured.named.tokenFile,
+      protocol: configured.protocol,
       logger,
     });
   }
